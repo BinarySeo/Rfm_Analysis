@@ -1,0 +1,28 @@
+name: SQL pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  mysql:
+    runs-on: ubuntu-latest
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports: ["3306:3306"]
+        options: >-
+          --health-cmd="mysqladmin ping -proot"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Allow LOAD DATA LOCAL
+        run: mysql -h 127.0.0.1 -u root -proot -e "SET GLOBAL local_infile = 1"
+      # Loads the CSV, runs EDA + RFM, and fails if any data-quality check is non-zero
+      - name: Run pipeline and checks
+        run: ./run.sh
+        env:
+          MYSQL_OPTS: -h 127.0.0.1 -u root -proot

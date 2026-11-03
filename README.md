@@ -58,16 +58,17 @@ The dataset revolves around the `sales` table, which includes details on orders,
 
 ## 🛠️ Data Preparation & Cleaning
 
+[`sql/01_load.sql`](sql/01_load.sql) loads the CSV into a text staging table, then builds a typed `sales` table:
+
+* **Dates** — `'2/24/03'` is parsed once into a real `DATE` column (the original text is kept), instead of overwriting the column in place, so the script can be re-run safely.
+* **Types & keys** — money as `DECIMAL`, counts as integers, primary key on order number + line number, indexes on customer and date.
+* **Clean-up** — the CSV uses Windows line endings, which left a hidden `\r` on the last column and split "Medium" deals into two groups; it's stripped on load.
+
 ```sql
--- Disable safe updates for data modification
-SET sql_safe_updates = 0;
-
--- Standardize orderdate column from string format ('%m/%d/%y %H:%i:%s') to DATETIME
-UPDATE sales
-SET orderdate = STR_TO_DATE(orderdate, "%m/%d/%y %H:%i:%s");
-
--- Verify maximum order date for recency benchmarks
-SELECT MAX(orderdate) FROM sales;
+INSERT INTO sales
+SELECT ..., STR_TO_DATE(ORDERDATE, '%m/%d/%y') AS orderdate, ORDERDATE AS order_date_raw, ...,
+       TRIM(REPLACE(DEALSIZE, '\r', '')) AS dealsize
+FROM sales_raw;
 ```
 
 ---
@@ -126,83 +127,50 @@ SELECT DISTINCT territory FROM sales;       -- 4 territories
 
 ## 📈 RFM Analysis & Customer Segmentation
 
-### 1. Constructing the RFM Temporary Table
-We utilize Common Table Expressions (CTEs) alongside window functions (`NTILE(4)`) to compute RFM metrics for each customer relative to the latest transaction date in the dataset.
+[`sql/03_rfm.sql`](sql/03_rfm.sql) builds two views so results always reflect the current data.
+
+### 1. RFM scores (`customer_rfm` view)
+
+* **Recency** — days between the customer's last order and the last order in the data
+* **Frequency** — number of distinct orders (not order lines)
+* **Monetary** — total sales
 
 ```sql
-DROP TABLE IF EXISTS rfm_temp;
-
-CREATE TEMPORARY TABLE rfm_temp (
-    Customername VARCHAR(50),
-    Monetary DOUBLE,
-    Average_Monetary DOUBLE,
-    Frequency INT,
-    last_order_date DATE,
-    last_date DATE,
-    recency INT,
-    rfm_recency INT,
-    rfm_frequency INT,
-    rfm_Monetary INT,
-    Rfm_Cell INT,
-    rfm_cell_string VARCHAR(10)
-);
-
--- Calculate raw RFM metrics and NTILE score rankings
-INSERT INTO rfm_temp
+CREATE OR REPLACE VIEW customer_rfm AS
 WITH rfm AS (
-    SELECT 
-        customername,
-        SUM(sales) AS Monetary,
-        AVG(sales) AS Average_Monetary,
-        COUNT(orderdate) AS Frequency,
-        MAX(orderdate) AS last_order_date,
-        (SELECT MAX(orderdate) FROM sales) AS last_date,
-        DATEDIFF((SELECT MAX(orderdate) FROM sales), MAX(orderdate)) AS recency
-    FROM sales 
+    SELECT customername,
+           DATEDIFF((SELECT MAX(orderdate) FROM sales), MAX(orderdate)) AS recency,
+           COUNT(DISTINCT ordernumber)                                  AS frequency,
+           SUM(sales)                                                   AS monetary
+    FROM sales
     GROUP BY customername
 ),
-rfm_calc AS (
-    SELECT 
-        r.*,
-        NTILE(4) OVER (ORDER BY recency DESC) AS rfm_recency,
-        NTILE(4) OVER (ORDER BY Frequency ASC) AS rfm_frequency,
-        NTILE(4) OVER (ORDER BY Monetary ASC) AS rfm_Monetary
-    FROM rfm r
+scored AS (
+    SELECT rfm.*,
+           NTILE(4) OVER (ORDER BY recency DESC, customername) AS r_score,
+           NTILE(4) OVER (ORDER BY frequency,    customername) AS f_score,
+           NTILE(4) OVER (ORDER BY monetary,     customername) AS m_score
+    FROM rfm
 )
-SELECT 
-    c.*, 
-    (rfm_recency + rfm_frequency + rfm_Monetary) AS Rfm_Cell,
-    CONCAT(rfm_recency, rfm_frequency, rfm_Monetary) AS rfm_cell_string
-FROM rfm_calc c;
+SELECT scored.*, CONCAT(r_score, f_score, m_score) AS rfm_cell
+FROM scored;
 ```
 
----
+The customer-name tie-breaker in each `NTILE` makes scores reproducible: without it, customers with equal values can land in different quartiles from one run (or server) to the next.
 
-### 2. Segment Classification Rules
+### 2. Segments (`rfm_segment_map` + `customer_segments` view)
 
-Customers are rated from **1 to 4** across Recency, Frequency, and Monetary parameters (4 being the highest/best rating).
+Customers are rated from **1 to 4** on each dimension (4 = best). Instead of long `CASE ... IN (...)` lists, every one of the 64 possible combinations lives in a lookup table, so no customer can end up without a segment.
 
-| Customer Category | Description & Business Strategy | RFM Combinations |
-| :--- | :--- | :--- |
-| **Regular** | Most active, recent, and high-spending customers. Maintain loyalty through rewards and exclusive offers. | `444`, `443`, `442`, `441`, `434`, `433`, `432`, `344`, `334`, `343`, `342`, `341`, `333`, `332`, `331`, `244`, `243`, `242`, `241` |
-| **Target** | Moderate activity/recency. Key focus group for pre-peak season campaigns to re-engage before November. | `431`, `424`, `423`, `422`, `421`, `414`, `413`, `412`, `411`, `324`, `323`, `322`, `321`, `314`, `313`, `312`, `311`, `224`, `223`, `232`, `233`, `234` |
-| **Inactive** | Lapsed buyers or one-time high spenders who haven't returned recently. Requires win-back incentives. | `144`, `143`, `142`, `141`, `134`, `133`, `132`, `131`, `124`, `123`, `122`, `121`, `112`, `111`, `211`, `212`, `213`, `214`, `222`, `221` |
+| Segment | Customers | Sales | Strategy | RFM combinations |
+| :--- | ---: | ---: | :--- | :--- |
+| **Regular** | 40 | $6.03M | Most active, recent and high-spending. Keep them loyal with rewards and early access. | `444` `443` `442` `441` `434` `433` `432` `344` `343` `342` `341` `334` `333` `332` `331` `244` `243` `242` `241` |
+| **Target** | 23 | $2.03M | Moderate activity. Main audience for pre-November campaigns; includes `113`/`114`, big past buyers who stopped returning. | `431` `424` `423` `422` `421` `414` `413` `412` `411` `324` `323` `322` `321` `314` `313` `312` `311` `234` `233` `232` `231` `224` `223` `114` `113` |
+| **Inactive** | 29 | $1.97M | Lapsed buyers. Win-back incentives. | `144` `143` `142` `141` `134` `133` `132` `131` `124` `123` `122` `121` `112` `111` `214` `213` `212` `211` `222` `221` |
 
-```sql
-SELECT 
-    customername, 
-    rfm_recency, 
-    rfm_frequency, 
-    rfm_Monetary,
-    CASE
-        WHEN rfm_cell_string IN ('144','143','142','141','134','133','132','131','124','123','122','121','112','111','211','212','213','214','222','221') THEN 'Inactive'
-        WHEN rfm_cell_string IN ('431','424','423','422','421','414','413','412','411','324','323','322','321','314','313','312','311','224','223','232','233','234') THEN 'Target'
-        WHEN rfm_cell_string IN ('444','443','442','441','434','433','432','344','334','343','342','341','333','332','331','244','243','242','241') THEN 'Regular'
-    END AS customer_type
-FROM rfm_temp;
-```
+### 3. Data-quality checks
 
-> **Note:** three score combinations (`113`, `114`, `231`) aren't in any list yet, so a customer with one of them would get a `NULL` segment. A natural fix is `113`/`114` → Inactive and `231` → Target.
+[`sql/04_checks.sql`](sql/04_checks.sql) runs 14 checks — every row loaded, dates parsed and consistent with the year/month columns, clean category values, all 64 cells mapped, every customer scored and segmented, balanced quartiles, and score ordering. The pipeline fails if any check is non-zero.
 
 ---
 
@@ -215,7 +183,21 @@ FROM rfm_temp;
 ---
 
 ## 🛠️ How to Run
-1. Load your sales dataset into MySQL.
-2. Execute the data preparation and date conversion queries.
-3. Run the EDA scripts to review general sales metrics.
-4. Execute the RFM temporary table creation script followed by the final classification query to output customer segments.
+
+Requires MySQL 8+ or MariaDB 10.6+ with `local_infile` enabled.
+
+```bash
+./run.sh                                          # database "rfm" on localhost
+MYSQL_OPTS="-h 127.0.0.1 -u root -p" ./run.sh     # other host or user
+```
+
+`run.sh` loads the data, runs the EDA and RFM scripts in order, then the checks. Each script can also be run on its own:
+
+| File | What it does |
+|---|---|
+| `sql/01_load.sql` | Load the CSV into a typed `sales` table |
+| `sql/02_eda.sql` | Exploratory queries behind the Key Findings |
+| `sql/03_rfm.sql` | RFM views, segment lookup and result queries |
+| `sql/04_checks.sql` | Data-quality and logic checks (all must be 0) |
+
+GitHub Actions runs the whole pipeline against MySQL 8.4 on every push and pull request.
