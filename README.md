@@ -10,6 +10,24 @@ The primary objective of this project is to analyze historical sales data to und
 
 By categorizing customers into actionable segments (**Regular**, **Target**, and **Inactive**), this project provides actionable insights for marketing strategies—specifically aiming to re-engage high-value inactive customers and optimize promotional campaigns prior to peak sales months (e.g., November).
 
+**Skills:** MySQL · data cleaning (`STR_TO_DATE`) · aggregation & EDA · CTEs · window functions (`NTILE`) · temporary tables · `CASE`-based segmentation · translating results into marketing actions
+
+---
+
+## 🔑 Key Findings
+
+*2,823 order lines · 307 orders · 92 customers · Jan 2003 – May 2005 · $10.03M total sales*
+
+| Question | Answer |
+|---|---|
+| Top product line | **Classic Cars** — $3.92M (39% of revenue), followed by Vintage Cars ($1.90M) |
+| Best territory | **EMEA** — $4.98M, ahead of North America ($3.85M); USA is the top single country ($3.63M) |
+| Deal size | **Medium** deals bring in $6.09M (61%) — more than Small and Large combined |
+| Seasonality | **November** is the peak month: $2.12M across 2003–04, nearly double October ($1.12M) |
+| Year over year | 2004 sales ($4.72M) grew **34%** over 2003 ($3.52M); 2005 covers only Jan–May |
+
+These findings drive the segmentation below: the November peak sets the campaign timing, and the RFM segments decide who to target.
+
 ---
 
 ## 🎯 Key Objectives
@@ -183,6 +201,8 @@ SELECT
     END AS customer_type
 FROM rfm_temp;
 ```
+
+> **Note:** three score combinations (`113`, `114`, `231`) aren't in any list yet, so a customer with one of them would get a `NULL` segment. A natural fix is `113`/`114` → Inactive and `231` → Target.
 
 ---
 
